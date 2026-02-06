@@ -1,0 +1,3 @@
+# Array and Pointer Arithmetic - Code Explanation
+
+This program demonstrates working with arrays using pointer arithmetic. First, it creates an array of 5 integers `{10, 20, 30, 40, 50}` and a pointer that points to the first element. It then traverses the array using pointer arithmetic `*(pointer + i)` to print all original values. Next, it modifies each element by adding 10 using the same pointer arithmetic approach. Finally, it prints the modified array twice: once using the pointer with `*(pointer + i)` and once using standard array notation `arr[i]`, demonstrating that both methods access the same memory locations. The final array becomes `{20, 30, 40, 50, 60}`.
