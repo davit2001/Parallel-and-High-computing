@@ -1,0 +1,3 @@
+# Swap Function Using Pointers - Code Explanation
+
+This program demonstrates how to swap two integer values using pointers. The `swap()` function takes two pointer parameters that point to the integers to be swapped. It uses a temporary variable to store one value, then swaps the values at the memory addresses pointed to by the pointers. In `main()`, two integers `x = 10` and `y = 20` are declared, and their addresses are passed to the swap function using the `&` operator. After the swap, the values are exchanged: `x` becomes 20 and `y` becomes 10, demonstrating how pointers allow functions to modify the original variables instead of just working with copies.
