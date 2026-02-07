@@ -26,5 +26,7 @@ int main() {
   swap(&x, &y);
 
   printf("After swap:\n");
-   printf("x: %d\ny: %d\n", x, y);
+  printf("x: %d\ny: %d\n", x, y);
+
+  return 0;
 }

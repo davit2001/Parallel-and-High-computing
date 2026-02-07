@@ -1,0 +1,3 @@
+# Double Pointer - Code Explanation
+
+This program demonstrates the concept of double pointers (pointer to pointer). An integer variable `value` is initialized with 100, and a regular pointer `pointer1` is set to point to this variable. Then, a double pointer `pointer2` is declared and initialized to point to `pointer1`. The program prints the value of the integer using two methods: `*pointer1` dereferences the pointer once to access the value directly, while `**pointer2` requires two dereferences - first to get the address stored in `pointer1`, then to get the actual value. Both methods print 100, demonstrating different levels of indirection to access the same data.
