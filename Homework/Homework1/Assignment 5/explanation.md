@@ -1,0 +1,3 @@
+# Dynamic Memory Allocation with malloc() - Code Explanation
+
+This program demonstrates dynamic memory allocation using `malloc()` for both single variables and arrays. First, it allocates memory on the heap for a single integer using `malloc(sizeof(int))`, checks if allocation succeeded, then assigns the value 100 and prints it. Next, it allocates memory for an array of 5 integers using `malloc(5 * sizeof(int))`, again checking for allocation failure. The array is then populated using pointer arithmetic `*(arr + i) = i + 1`, which assigns values 1, 2, 3, 4, 5 to consecutive memory locations. Finally, both allocated memory blocks are freed using `free()` to prevent memory leaks.

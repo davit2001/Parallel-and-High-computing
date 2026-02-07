@@ -1,7 +1,3 @@
-// Write a function swap(int *a, int *b) that swaps two integer values using pointers.
-// In the main() function, call swap() and pass the addresses of two integers.
-// Print the values of the integers before and after the swap.
-
 #include <stdio.h>
 
 
