@@ -1,0 +1,3 @@
+# Array of Strings - Code Explanation
+
+This program demonstrates working with an array of strings in C. An array of character pointers `char *names[]` is declared with 5 string literals: "Alice", "Bob", "Charlie", "David", and "Eve". Each element in this array is a pointer to a string stored in memory. The first loop prints all names using pointer arithmetic `*(names + i)`, which is equivalent to `names[i]` but explicitly shows pointer manipulation. Then, the program modifies the second element by reassigning `names[1]` to point to a new string "Babken", demonstrating that array elements are pointers that can be redirected to different strings. The second loop prints the updated array, showing "Bob" has been replaced with "Babken" while all other names remain unchanged.
