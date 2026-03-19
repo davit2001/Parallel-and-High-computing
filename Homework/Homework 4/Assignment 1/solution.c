@@ -1,228 +1,205 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
-#include <arm_neon.h>
+#include <emmintrin.h>
 
-#define DNA_SIZE_MB 256
-#define DNA_SIZE ((size_t)(DNA_SIZE_MB) * 1024 * 1024)
-#define NUM_THREADS 4
+#define SIZE_MB 256
+#define THREADS 4
+#define MB      (1024ULL * 1024ULL)
 
-static double elapsed_sec(struct timespec a, struct timespec b) {
-    return (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) * 1e-9;
-}
-
-static void generate_dna(char *buf, size_t n) {
-    static const char alphabet[4] = {'A','C','G','T'};
-    uint64_t rng = 0xdeadbeefcafe1234ULL;
-    for (size_t i = 0; i < n; i++) {
-        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-        buf[i] = alphabet[rng & 3];
-    }
-}
-
-static void scalar_count(const char *buf, size_t n,
-    long long *cA, long long *cC,
-    long long *cG, long long *cT)
+static double now_sec(void)
 {
-    long long a=0,c=0,g=0,t=0;
-    for (size_t i = 0; i < n; i++) {
-        switch (buf[i]) {
-            case 'A': a++; break;
-            case 'C': c++; break;
-            case 'G': g++; break;
-            case 'T': t++; break;
-        }
-    }
-    *cA=a; *cC=c; *cG=g; *cT=t;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-typedef struct {
-    const char *buf;
-    size_t start, end;
-} ChunkArgs;
+static void generate_dna(char *buf, size_t n)
+{
+    static const char nuc[4] = {'A','C','G','T'};
+    for (size_t i = 0; i < n; i++)
+        buf[i] = nuc[rand() & 3];
+}
 
-static long long g_A, g_C, g_G, g_T;
-static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void count_scalar(const char *buf, size_t n,
+    long long *a, long long *c,
+    long long *g, long long *t)
+{
+    long long la=0, lc=0, lg=0, lt=0;
+    for (size_t i = 0; i < n; i++) {
+        char ch = buf[i];
+        if      (ch == 'A') la++;
+        else if (ch == 'C') lc++;
+        else if (ch == 'G') lg++;
+        else                lt++;
+    }
+    *a=la; *c=lc; *g=lg; *t=lt;
+}
 
-static void *mt_worker(void *arg) {
-    ChunkArgs *a = (ChunkArgs *)arg;
-    long long la=0,lc=0,lg=0,lt=0;
+typedef struct { const char *buf; size_t start, end; } MT_Args;
+
+static long long       mt_A, mt_C, mt_G, mt_T;
+static pthread_mutex_t mt_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void *mt_worker(void *arg)
+{
+    MT_Args *a = (MT_Args *)arg;
+    long long la=0, lc=0, lg=0, lt=0;
     for (size_t i = a->start; i < a->end; i++) {
-        switch (a->buf[i]) {
-            case 'A': la++; break;
-            case 'C': lc++; break;
-            case 'G': lg++; break;
-            case 'T': lt++; break;
-        }
+        char ch = a->buf[i];
+        if      (ch == 'A') la++;
+        else if (ch == 'C') lc++;
+        else if (ch == 'G') lg++;
+        else                lt++;
     }
-    pthread_mutex_lock(&g_mutex);
-    g_A += la; g_C += lc; g_G += lg; g_T += lt;
-    pthread_mutex_unlock(&g_mutex);
+    pthread_mutex_lock(&mt_mu);
+    mt_A += la; mt_C += lc; mt_G += lg; mt_T += lt;
+    pthread_mutex_unlock(&mt_mu);
     return NULL;
 }
 
-static void mt_count(const char *buf, size_t n, int nthreads,
-    long long *cA, long long *cC,
-    long long *cG, long long *cT)
+static void count_mt(const char *buf, size_t n, int nthreads,
+    long long *a, long long *c,
+    long long *g, long long *t)
 {
-    g_A=g_C=g_G=g_T=0;
-    pthread_t threads[nthreads];
-    ChunkArgs args[nthreads];
+    mt_A = mt_C = mt_G = mt_T = 0;
+    pthread_t *th   = malloc(nthreads * sizeof(pthread_t));
+    MT_Args   *args = malloc(nthreads * sizeof(MT_Args));
     size_t chunk = n / nthreads;
-    for (int t = 0; t < nthreads; t++) {
-        args[t].buf = buf;
-        args[t].start = (size_t)t * chunk;
-        args[t].end = (t == nthreads-1) ? n : args[t].start + chunk;
-        pthread_create(&threads[t], NULL, mt_worker, &args[t]);
+    for (int i = 0; i < nthreads; i++) {
+        args[i].buf   = buf;
+        args[i].start = (size_t)i * chunk;
+        args[i].end   = (i == nthreads-1) ? n : args[i].start + chunk;
+        pthread_create(&th[i], NULL, mt_worker, &args[i]);
     }
-    for (int t = 0; t < nthreads; t++) pthread_join(threads[t], NULL);
-    *cA=g_A; *cC=g_C; *cG=g_G; *cT=g_T;
+    for (int i = 0; i < nthreads; i++)
+        pthread_join(th[i], NULL);
+    *a=mt_A; *c=mt_C; *g=mt_G; *t=mt_T;
+    free(th); free(args);
 }
 
-static void simd_count(const char *buf, size_t n,
-    long long *cA, long long *cC,
-    long long *cG, long long *cT)
+static void count_simd(const char *buf, size_t n,
+                        long long *ra, long long *rc,
+                        long long *rg, long long *rt)
 {
-    const uint8x16_t vA = vdupq_n_u8('A');
-    const uint8x16_t vC = vdupq_n_u8('C');
-    const uint8x16_t vG = vdupq_n_u8('G');
-    const uint8x16_t vT = vdupq_n_u8('T');
-
-    long long accA=0, accC=0, accG=0, accT=0;
-
-    uint8x16_t sumA8 = vdupq_n_u8(0);
-    uint8x16_t sumC8 = vdupq_n_u8(0);
-    uint8x16_t sumG8 = vdupq_n_u8(0);
-    uint8x16_t sumT8 = vdupq_n_u8(0);
-
-    size_t vec_n = n & ~(size_t)15;
-    size_t i = 0;
-    int inner = 0;
-
-    for (; i < vec_n; i += 16, inner++) {
-        uint8x16_t data = vld1q_u8((const uint8_t *)(buf + i));
-        sumA8 = vaddq_u8(sumA8, vandq_u8(vceqq_u8(data, vA), vdupq_n_u8(1)));
-        sumC8 = vaddq_u8(sumC8, vandq_u8(vceqq_u8(data, vC), vdupq_n_u8(1)));
-        sumG8 = vaddq_u8(sumG8, vandq_u8(vceqq_u8(data, vG), vdupq_n_u8(1)));
-        sumT8 = vaddq_u8(sumT8, vandq_u8(vceqq_u8(data, vT), vdupq_n_u8(1)));
-
-        if (inner == 254) {
-            accA += vaddlvq_u8(sumA8);
-            accC += vaddlvq_u8(sumC8);
-            accG += vaddlvq_u8(sumG8);
-            accT += vaddlvq_u8(sumT8);
-            sumA8 = sumC8 = sumG8 = sumT8 = vdupq_n_u8(0);
-            inner = 0;
+    const __m128i vA = _mm_set1_epi8('A');
+    const __m128i vC = _mm_set1_epi8('C');
+    const __m128i vG = _mm_set1_epi8('G');
+    const __m128i vT = _mm_set1_epi8('T');
+    const __m128i z  = _mm_setzero_si128();
+    __m128i sum32A=z, sum32C=z, sum32G=z, sum32T=z;
+    __m128i accA=z, accC=z, accG=z, accT=z;
+    size_t vec_end = n - (n % 16);
+    int cycle = 0;
+    for (size_t i = 0; i < vec_end; i += 16) {
+        __m128i data = _mm_loadu_si128((const __m128i *)(buf + i));
+        accA = _mm_sub_epi8(accA, _mm_cmpeq_epi8(data, vA));
+        accC = _mm_sub_epi8(accC, _mm_cmpeq_epi8(data, vC));
+        accG = _mm_sub_epi8(accG, _mm_cmpeq_epi8(data, vG));
+        accT = _mm_sub_epi8(accT, _mm_cmpeq_epi8(data, vT));
+        if (++cycle == 255) {
+            sum32A = _mm_add_epi32(sum32A, _mm_sad_epu8(accA, z));
+            sum32C = _mm_add_epi32(sum32C, _mm_sad_epu8(accC, z));
+            sum32G = _mm_add_epi32(sum32G, _mm_sad_epu8(accG, z));
+            sum32T = _mm_add_epi32(sum32T, _mm_sad_epu8(accT, z));
+            accA = accC = accG = accT = z;
+            cycle = 0;
         }
     }
-
-    accA += vaddlvq_u8(sumA8);
-    accC += vaddlvq_u8(sumC8);
-    accG += vaddlvq_u8(sumG8);
-    accT += vaddlvq_u8(sumT8);
-
-    for (; i < n; i++) {
-        switch (buf[i]) {
-            case 'A': accA++; break;
-            case 'C': accC++; break;
-            case 'G': accG++; break;
-            case 'T': accT++; break;
-        }
+    sum32A = _mm_add_epi32(sum32A, _mm_sad_epu8(accA, z));
+    sum32C = _mm_add_epi32(sum32C, _mm_sad_epu8(accC, z));
+    sum32G = _mm_add_epi32(sum32G, _mm_sad_epu8(accG, z));
+    sum32T = _mm_add_epi32(sum32T, _mm_sad_epu8(accT, z));
+    int32_t tmp[4];
+#define HSUM(vec, out) do { \
+    _mm_storeu_si128((__m128i*)tmp, (vec)); \
+    (out) = (long long)tmp[0]+tmp[1]+tmp[2]+tmp[3]; \
+} while(0)
+    long long la, lc, lg, lt;
+    HSUM(sum32A, la); HSUM(sum32C, lc);
+    HSUM(sum32G, lg); HSUM(sum32T, lt);
+    for (size_t i = vec_end; i < n; i++) {
+        char ch = buf[i];
+        if      (ch == 'A') la++;
+        else if (ch == 'C') lc++;
+        else if (ch == 'G') lg++;
+        else                lt++;
     }
-    *cA=accA; *cC=accC; *cG=accG; *cT=accT;
+    *ra=la; *rc=lc; *rg=lg; *rt=lt;
 }
 
 typedef struct {
     const char *buf;
-    size_t start, end;
-    long long lA, lC, lG, lT;
-} SimdChunkArgs;
+    size_t      start, end;
+    long long   a, c, g, t;
+} SIMD_MT_Args;
 
-static void *simd_mt_worker(void *arg) {
-    SimdChunkArgs *a = (SimdChunkArgs *)arg;
-    simd_count(a->buf + a->start, a->end - a->start,
-               &a->lA, &a->lC, &a->lG, &a->lT);
+static void *simd_mt_worker(void *arg)
+{
+    SIMD_MT_Args *a = (SIMD_MT_Args *)arg;
+    count_simd(a->buf + a->start, a->end - a->start,
+               &a->a, &a->c, &a->g, &a->t);
     return NULL;
 }
 
-static void simd_mt_count(const char *buf, size_t n, int nthreads,
-    long long *cA, long long *cC,
-    long long *cG, long long *cT)
+static void count_simd_mt(const char *buf, size_t n, int nthreads,
+    long long *ra, long long *rc,
+    long long *rg, long long *rt
+)
 {
-    pthread_t threads[nthreads];
-    SimdChunkArgs args[nthreads];
+    pthread_t    *th   = malloc(nthreads * sizeof(pthread_t));
+    SIMD_MT_Args *args = malloc(nthreads * sizeof(SIMD_MT_Args));
     size_t chunk = n / nthreads;
-    for (int t = 0; t < nthreads; t++) {
-        args[t].buf = buf;
-        args[t].start = (size_t)t * chunk;
-        args[t].end = (t == nthreads-1) ? n : args[t].start + chunk;
-        pthread_create(&threads[t], NULL, simd_mt_worker, &args[t]);
+    for (int i = 0; i < nthreads; i++) {
+        args[i].buf   = buf;
+        args[i].start = (size_t)i * chunk;
+        args[i].end   = (i == nthreads-1) ? n : args[i].start + chunk;
+        args[i].a = args[i].c = args[i].g = args[i].t = 0;
+        pthread_create(&th[i], NULL, simd_mt_worker, &args[i]);
     }
-    long long A=0,C=0,G=0,T=0;
-    for (int t = 0; t < nthreads; t++) {
-        pthread_join(threads[t], NULL);
-        A += args[t].lA; C += args[t].lC;
-        G += args[t].lG; T += args[t].lT;
+    long long ta=0, tc=0, tg=0, tt=0;
+    for (int i = 0; i < nthreads; i++) {
+        pthread_join(th[i], NULL);
+        ta += args[i].a; tc += args[i].c;
+        tg += args[i].g; tt += args[i].t;
     }
-    *cA=A; *cC=C; *cG=G; *cT=T;
+    *ra=ta; *rc=tc; *rg=tg; *rt=tt;
+    free(th); free(args);
 }
 
-int main(void) {
-    printf("Allocating %d MB DNA buffer...\n", DNA_SIZE_MB);
-    char *dna = (char *)malloc(DNA_SIZE);
-    if (!dna) { perror("malloc"); return 1; }
-
-    printf("Generating random DNA sequence...\n\n");
-    generate_dna(dna, DNA_SIZE);
-
-    printf("DNA size: %d MB\n", DNA_SIZE_MB);
-    printf("Threads used: %d\n\n", NUM_THREADS);
-
-    struct timespec t0, t1;
-    long long A, C, G, T;
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    scalar_count(dna, DNA_SIZE, &A, &C, &G, &T);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double t_scalar = elapsed_sec(t0, t1);
-    long long refA=A, refC=C, refG=G, refT=T;
-
-    printf("Counts (A C G T):\n");
-    printf(" %lld %lld %lld %lld\n\n", A, C, G, T);
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    mt_count(dna, DNA_SIZE, NUM_THREADS, &A, &C, &G, &T);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double t_mt = elapsed_sec(t0, t1);
-    printf("MT verify: %s\n",
-           (A==refA&&C==refC&&G==refG&&T==refT) ? "OK" : "MISMATCH");
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    simd_count(dna, DNA_SIZE, &A, &C, &G, &T);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double t_simd = elapsed_sec(t0, t1);
-    printf("SIMD verify: %s\n",
-           (A==refA&&C==refC&&G==refG&&T==refT) ? "OK" : "MISMATCH");
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    simd_mt_count(dna, DNA_SIZE, NUM_THREADS, &A, &C, &G, &T);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double t_simd_mt = elapsed_sec(t0, t1);
-    printf("SIMD+MT verify: %s\n\n",
-           (A==refA&&C==refC&&G==refG&&T==refT) ? "OK" : "MISMATCH");
-
-    printf("%-35s %.3f sec\n", "Scalar time:", t_scalar);
-    printf("%-35s %.3f sec (%.1fx)\n", "Multithreading time:", t_mt,
-           t_scalar / t_mt);
-    printf("%-35s %.3f sec (%.1fx)\n", "SIMD time:", t_simd,
-           t_scalar / t_simd);
-    printf("%-35s %.3f sec (%.1fx)\n", "SIMD + Multithreading time:",
-           t_simd_mt, t_scalar / t_simd_mt);
-
-    free(dna);
+int main(void)
+{
+    const size_t n = (size_t)SIZE_MB * MB;
+    printf("Allocating %d MB ...\n", SIZE_MB);
+    char *buf = malloc(n);
+    if (!buf) { perror("malloc"); return 1; }
+    printf("Generating random DNA sequence ...\n");
+    srand(42);
+    generate_dna(buf, n);
+    printf("\nDNA size: %d MB  (%zu bytes)\n", SIZE_MB, n);
+    printf("Threads used: %d\n\n", THREADS);
+    long long a, c, g, t;
+    double t0, t1;
+    t0 = now_sec();
+    count_scalar(buf, n, &a, &c, &g, &t);
+    t1 = now_sec();
+    printf("Counts (A C G T):\n%lld %lld %lld %lld\n\n", a, c, g, t);
+    printf("Scalar time:  %.3f sec\n", t1 - t0);
+    t0 = now_sec();
+    count_mt(buf, n, THREADS, &a, &c, &g, &t);
+    t1 = now_sec();
+    printf("Multithreading time: %.3f sec\n", t1 - t0);
+    t0 = now_sec();
+    count_simd(buf, n, &a, &c, &g, &t);
+    t1 = now_sec();
+    printf("SIMD time: %.3f sec\n", t1 - t0);
+    t0 = now_sec();
+    count_simd_mt(buf, n, THREADS, &a, &c, &g, &t);
+    t1 = now_sec();
+    printf("SIMD + Multithreading time: %.3f sec\n", t1 - t0);
+    free(buf);
     return 0;
 }

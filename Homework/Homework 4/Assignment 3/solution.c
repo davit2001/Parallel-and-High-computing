@@ -1,280 +1,181 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
-#include <arm_neon.h>
+#include <emmintrin.h>
 
-#define NUM_THREADS 4
+#define THREADS 4
 
-typedef struct {
-    int width, height, maxval;
-    uint8_t *data;
-} Image;
+#define kR 9798
+#define kG 19235
+#define kB 3735
 
-static double elapsed_sec(struct timespec a, struct timespec b) {
-    return (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) * 1e-9;
+typedef struct { int width, height; uint8_t *data; } Image;
+
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-static Image *alloc_image(int w, int h) {
-    Image *img = malloc(sizeof(Image));
-    img->width = w;
-    img->height = h;
-    img->maxval = 255;
-    img->data = malloc((size_t)w * h * 3);
-    return img;
-}
-
-static void free_image(Image *img) {
-    free(img->data);
-    free(img);
-}
-
-static Image *read_ppm(const char *path) {
+static Image read_ppm(const char *path) {
+    Image img = {0};
     FILE *f = fopen(path, "rb");
-    if (!f) { perror(path); return NULL; }
-
-    char magic[3];
-    int w, h, maxval;
-    fscanf(f, "%2s %d %d %d", magic, &w, &h, &maxval);
+    if (!f) { perror(path); exit(1); }
+    char magic[3]; int maxval;
+    if (fscanf(f, "%2s %d %d %d", magic, &img.width, &img.height, &maxval) != 4 ||
+        magic[0] != 'P' || magic[1] != '6') {
+        fprintf(stderr, "Only P6 PPM supported\n"); exit(1);
+    }
     fgetc(f);
-
-    if (magic[0] != 'P' || magic[1] != '6') {
-        fprintf(stderr, "Only P6 PPM supported\n");
-        fclose(f); return NULL;
-    }
-
-    Image *img = alloc_image(w, h);
-    img->maxval = maxval;
-    size_t pixels = (size_t)w * h * 3;
-    if (fread(img->data, 1, pixels, f) != pixels) {
-        fprintf(stderr, "Failed to read pixel data\n");
-        free_image(img); fclose(f); return NULL;
-    }
+    size_t n = (size_t)img.width * img.height * 3;
+    img.data = malloc(n);
+    if (!img.data) { perror("malloc"); exit(1); }
+    if (fread(img.data, 1, n, f) != n) { fprintf(stderr, "fread\n"); exit(1); }
     fclose(f);
     return img;
 }
 
 static void write_ppm(const char *path, const Image *img) {
     FILE *f = fopen(path, "wb");
-    fprintf(f, "P6\n%d %d\n%d\n", img->width, img->height, img->maxval);
+    if (!f) { perror(path); exit(1); }
+    fprintf(f, "P6\n%d %d\n255\n", img->width, img->height);
     fwrite(img->data, 1, (size_t)img->width * img->height * 3, f);
     fclose(f);
 }
 
-static void generate_test_image(const char *path, int w, int h) {
-    FILE *f = fopen(path, "wb");
-    fprintf(f, "P6\n%d %d\n255\n", w, h);
-    uint64_t rng = 0xdeadbeefcafe1234ULL;
-    size_t n = (size_t)w * h * 3;
-    uint8_t *buf = malloc(n);
-    for (size_t i = 0; i < n; i++) {
-        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-        buf[i] = rng & 0xFF;
-    }
-    fwrite(buf, 1, n, f);
-    free(buf);
-    fclose(f);
-}
-
-static void scalar_grayscale(const Image *src, Image *dst) {
-    size_t npix = (size_t)src->width * src->height;
-    const int wr = (int)(0.299f * 256 + 0.5f);
-    const int wg = (int)(0.587f * 256 + 0.5f);
-    const int wb = (int)(0.114f * 256 + 0.5f);
-    for (size_t i = 0; i < npix; i++) {
-        uint8_t r = src->data[i*3];
-        uint8_t g = src->data[i*3+1];
-        uint8_t b = src->data[i*3+2];
-        uint8_t gray = (uint8_t)((wr*r + wg*g + wb*b) >> 8);
-        dst->data[i*3]   = gray;
-        dst->data[i*3+1] = gray;
-        dst->data[i*3+2] = gray;
+static void grayscale_scalar(const uint8_t *src, uint8_t *dst, size_t npixels) {
+    for (size_t i = 0; i < npixels; i++) {
+        uint8_t gray = (uint8_t)((kR*src[i*3] + kG*src[i*3+1] + kB*src[i*3+2]) >> 15);
+        dst[i*3] = dst[i*3+1] = dst[i*3+2] = gray;
     }
 }
 
-static void simd_grayscale(const Image *src, Image *dst) {
-    size_t npix = (size_t)src->width * src->height;
-
-    const uint8x8_t coeff_r = vdup_n_u8((uint8_t)(int)(0.299f*256+0.5f));
-    const uint8x8_t coeff_g = vdup_n_u8((uint8_t)(int)(0.587f*256+0.5f));
-    const uint8x8_t coeff_b = vdup_n_u8((uint8_t)(int)(0.114f*256+0.5f));
-
+static void grayscale_simd(const uint8_t *src, uint8_t *dst, size_t npixels) {
+    const __m128i coeff = _mm_set_epi16(0,kB,kG,kR, 0,kB,kG,kR);
+    const __m128i zero  = _mm_setzero_si128();
     size_t i = 0;
-    for (; i + 8 <= npix; i += 8) {
-        uint8x8x3_t px = vld3_u8(src->data + i*3);
 
-        uint16x8_t acc = vmull_u8(px.val[0], coeff_r);
-        acc = vmlal_u8(acc, px.val[1], coeff_g);
-        acc = vmlal_u8(acc, px.val[2], coeff_b);
+    for (; i + 4 <= npixels; i += 4) {
+        const uint8_t *s = src + i*3;
 
-        uint8x8_t gray = vshrn_n_u16(acc, 8);
+        __m128i raw = _mm_loadu_si128((const __m128i *)s);
+        __m128i v01 = _mm_set_epi16(0,s[5],s[4],s[3], 0,s[2],s[1],s[0]);
+        __m128i v23 = _mm_set_epi16(0,s[11],s[10],s[9], 0,s[8],s[7],s[6]);
 
-        uint8x8x3_t out;
-        out.val[0] = gray;
-        out.val[1] = gray;
-        out.val[2] = gray;
-        vst3_u8(dst->data + i*3, out);
+        int32_t t01[4], t23[4];
+        _mm_storeu_si128((__m128i *)t01, _mm_madd_epi16(v01, coeff));
+        _mm_storeu_si128((__m128i *)t23, _mm_madd_epi16(v23, coeff));
+
+        uint8_t g[4];
+        g[0] = (uint8_t)((t01[0]+t01[1]) >> 15);
+        g[1] = (uint8_t)((t01[2]+t01[3]) >> 15);
+        g[2] = (uint8_t)((t23[0]+t23[1]) >> 15);
+        g[3] = (uint8_t)((t23[2]+t23[3]) >> 15);
+
+        for (int p = 0; p < 4; p++)
+            dst[(i+p)*3] = dst[(i+p)*3+1] = dst[(i+p)*3+2] = g[p];
     }
-
-    for (; i < npix; i++) {
-        uint8_t r = src->data[i*3];
-        uint8_t g = src->data[i*3+1];
-        uint8_t b = src->data[i*3+2];
-        uint8_t gray = (uint8_t)(0.299f*r + 0.587f*g + 0.114f*b);
-        dst->data[i*3]   = gray;
-        dst->data[i*3+1] = gray;
-        dst->data[i*3+2] = gray;
-    }
-}
-
-typedef struct {
-    const Image *src;
-    Image *dst;
-    size_t start_pix, end_pix;
-    int use_simd;
-} WorkArgs;
-
-static void process_chunk_scalar(const Image *src, Image *dst,
-                                  size_t start, size_t end) {
-    const int wr = (int)(0.299f * 256 + 0.5f);
-    const int wg = (int)(0.587f * 256 + 0.5f);
-    const int wb = (int)(0.114f * 256 + 0.5f);
-    for (size_t i = start; i < end; i++) {
-        uint8_t r = src->data[i*3];
-        uint8_t g = src->data[i*3+1];
-        uint8_t b = src->data[i*3+2];
-        uint8_t gray = (uint8_t)((wr*r + wg*g + wb*b) >> 8);
-        dst->data[i*3]   = gray;
-        dst->data[i*3+1] = gray;
-        dst->data[i*3+2] = gray;
+    for (; i < npixels; i++) {
+        uint8_t gray = (uint8_t)((kR*src[i*3] + kG*src[i*3+1] + kB*src[i*3+2]) >> 15);
+        dst[i*3] = dst[i*3+1] = dst[i*3+2] = gray;
     }
 }
 
-static void process_chunk_simd(const Image *src, Image *dst,
-                                size_t start, size_t end) {
-    const uint8x8_t coeff_r = vdup_n_u8((uint8_t)(uint16_t)(0.299f*256+0.5f));
-    const uint8x8_t coeff_g = vdup_n_u8((uint8_t)(uint16_t)(0.587f*256+0.5f));
-    const uint8x8_t coeff_b = vdup_n_u8((uint8_t)(uint16_t)(0.114f*256+0.5f));
-
-    size_t i = start;
-    for (; i + 8 <= end; i += 8) {
-        uint8x8x3_t px = vld3_u8(src->data + i*3);
-        uint16x8_t acc = vmull_u8(px.val[0], coeff_r);
-        acc = vmlal_u8(acc, px.val[1], coeff_g);
-        acc = vmlal_u8(acc, px.val[2], coeff_b);
-        uint8x8_t gray = vshrn_n_u16(acc, 8);
-        uint8x8x3_t out;
-        out.val[0] = gray;
-        out.val[1] = gray;
-        out.val[2] = gray;
-        vst3_u8(dst->data + i*3, out);
-    }
-    for (; i < end; i++) {
-        uint8_t r = src->data[i*3];
-        uint8_t g = src->data[i*3+1];
-        uint8_t b = src->data[i*3+2];
-        uint8_t gray = (uint8_t)(0.299f*r + 0.587f*g + 0.114f*b);
-        dst->data[i*3]   = gray;
-        dst->data[i*3+1] = gray;
-        dst->data[i*3+2] = gray;
-    }
-}
+typedef struct { const uint8_t *src; uint8_t *dst; size_t start, end; } ChunkArgs;
 
 static void *mt_worker(void *arg) {
-    WorkArgs *a = (WorkArgs *)arg;
-    if (a->use_simd)
-        process_chunk_simd(a->src, a->dst, a->start_pix, a->end_pix);
-    else
-        process_chunk_scalar(a->src, a->dst, a->start_pix, a->end_pix);
+    ChunkArgs *a = (ChunkArgs *)arg;
+    grayscale_scalar(a->src + a->start*3, a->dst + a->start*3, a->end - a->start);
     return NULL;
 }
 
-static void mt_grayscale(const Image *src, Image *dst, int nthreads, int use_simd) {
+static void grayscale_mt(const uint8_t *src, uint8_t *dst, size_t npixels, int nthreads) {
     pthread_t threads[nthreads];
-    WorkArgs args[nthreads];
-    size_t npix = (size_t)src->width * src->height;
-    size_t chunk = npix / nthreads;
+    ChunkArgs args[nthreads];
+    size_t chunk = npixels / nthreads;
     for (int t = 0; t < nthreads; t++) {
-        args[t].src = src;
-        args[t].dst = dst;
-        args[t].start_pix = (size_t)t * chunk;
-        args[t].end_pix = (t == nthreads-1) ? npix : args[t].start_pix + chunk;
-        args[t].use_simd = use_simd;
+        args[t].src   = src;
+        args[t].dst   = dst;
+        args[t].start = (size_t)t * chunk;
+        args[t].end   = (t == nthreads-1) ? npixels : args[t].start + chunk;
         pthread_create(&threads[t], NULL, mt_worker, &args[t]);
     }
     for (int t = 0; t < nthreads; t++) pthread_join(threads[t], NULL);
 }
 
-static int verify(const Image *a, const Image *b) {
-    size_t n = (size_t)a->width * a->height * 3;
-    return memcmp(a->data, b->data, n) == 0;
+static void *simd_mt_worker(void *arg) {
+    ChunkArgs *a = (ChunkArgs *)arg;
+    grayscale_simd(a->src + a->start*3, a->dst + a->start*3, a->end - a->start);
+    return NULL;
 }
 
-int main(int argc, char **argv) {
-    const char *input = (argc > 1) ? argv[1] : "input.ppm";
-    const char *output = (argc > 2) ? argv[2] : "gray_output.ppm";
-
-    FILE *test = fopen(input, "rb");
-    if (!test) {
-        printf("No input image found, generating 3840x2160 test image...\n");
-        generate_test_image(input, 3840, 2160);
-    } else {
-        fclose(test);
+static void grayscale_simd_mt(const uint8_t *src, uint8_t *dst, size_t npixels, int nthreads) {
+    pthread_t threads[nthreads];
+    ChunkArgs args[nthreads];
+    size_t chunk = npixels / nthreads;
+    for (int t = 0; t < nthreads; t++) {
+        args[t].src   = src;
+        args[t].dst   = dst;
+        args[t].start = (size_t)t * chunk;
+        args[t].end   = (t == nthreads-1) ? npixels : args[t].start + chunk;
+        pthread_create(&threads[t], NULL, simd_mt_worker, &args[t]);
     }
+    for (int t = 0; t < nthreads; t++) pthread_join(threads[t], NULL);
+}
 
-    Image *src = read_ppm(input);
-    if (!src) return 1;
+static int verify(const uint8_t *ref, const uint8_t *out, size_t nbytes) {
+    for (size_t i = 0; i < nbytes; i++)
+        if (ref[i] != out[i]) return 0;
+    return 1;
+}
 
-    printf("Image size:   %d x %d\n", src->width, src->height);
-    printf("Threads used: %d\n\n", NUM_THREADS);
+int main(int argc, char *argv[]) {
+    if (argc < 2) { fprintf(stderr, "Usage: %s input.ppm\n", argv[0]); return 1; }
 
-    Image *dst_scalar   = alloc_image(src->width, src->height);
-    Image *dst_simd     = alloc_image(src->width, src->height);
-    Image *dst_mt       = alloc_image(src->width, src->height);
-    Image *dst_mt_simd  = alloc_image(src->width, src->height);
+    Image src = read_ppm(argv[1]);
+    size_t npixels = (size_t)src.width * src.height;
+    size_t nbytes  = npixels * 3;
 
-    struct timespec t0, t1;
+    uint8_t *out_scalar  = malloc(nbytes);
+    uint8_t *out_simd    = malloc(nbytes);
+    uint8_t *out_mt      = malloc(nbytes);
+    uint8_t *out_simd_mt = malloc(nbytes);
+    if (!out_scalar || !out_simd || !out_mt || !out_simd_mt) { perror("malloc"); return 1; }
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    scalar_grayscale(src, dst_scalar);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double t_scalar = elapsed_sec(t0, t1);
+    printf("Image size:   %d x %d\n", src.width, src.height);
+    printf("Threads used: %d\n\n", THREADS);
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    simd_grayscale(src, dst_simd);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double t_simd = elapsed_sec(t0, t1);
+    double t0, t1;
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    mt_grayscale(src, dst_mt, NUM_THREADS, 0);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double t_mt = elapsed_sec(t0, t1);
+    t0 = now_sec(); grayscale_scalar(src.data, out_scalar, npixels);
+    t1 = now_sec();
+    printf("Scalar time: %.3f sec\n", t1-t0);
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    mt_grayscale(src, dst_mt_simd, NUM_THREADS, 1);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double t_mt_simd = elapsed_sec(t0, t1);
+    t0 = now_sec(); grayscale_simd(src.data, out_simd, npixels);
+    t1 = now_sec();
+    printf("SIMD time: %.3f sec\n", t1-t0);
 
-    int ok = verify(dst_scalar, dst_simd) &&
-             verify(dst_scalar, dst_mt) &&
-             verify(dst_scalar, dst_mt_simd);
+    t0 = now_sec(); grayscale_mt(src.data, out_mt, npixels, THREADS);
+    t1 = now_sec();
+    printf("MT time: %.3f sec\n", t1-t0);
 
-    printf("%-30s %.3f sec\n", "Scalar time:", t_scalar);
-    printf("%-30s %.3f sec\n", "SIMD time:", t_simd);
-    printf("%-30s %.3f sec\n", "Multithreading time:", t_mt);
-    printf("%-30s %.3f sec\n", "Multithreading + SIMD time:", t_mt_simd);
+    t0 = now_sec(); grayscale_simd_mt(src.data, out_simd_mt, npixels, THREADS);
+    t1 = now_sec();
+    printf("SIMD + MT time:      %.3f sec\n", t1-t0);
+
+    int ok = verify(out_scalar, out_simd,    nbytes) &&
+             verify(out_scalar, out_mt,      nbytes) &&
+             verify(out_scalar, out_simd_mt, nbytes);
     printf("\nVerification: %s\n", ok ? "PASSED" : "FAILED");
 
-    write_ppm(output, dst_scalar);
-    printf("Output image: %s\n", output);
+    Image out_img = { src.width, src.height, out_scalar };
+    write_ppm("gray_output.ppm", &out_img);
+    printf("Output image: gray_output.ppm\n");
 
-    free_image(src);
-    free_image(dst_scalar);
-    free_image(dst_simd);
-    free_image(dst_mt);
-    free_image(dst_mt_simd);
+    free(src.data);
+    free(out_scalar); free(out_simd); free(out_mt); free(out_simd_mt);
     return 0;
 }
